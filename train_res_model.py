@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,7 +17,16 @@ import torch.optim as optim
 from sklearn.metrics import confusion_matrix, f1_score
 from sklearn.manifold import TSNE
 
-from data_processing import assemble_dataset, create_dataloaders, load_numpy_dataset, save_numpy_dataset
+from data_processing import (
+    assemble_dataset,
+    create_dataloaders,
+    load_inference_windows,
+    load_numpy_dataset,
+    save_numpy_dataset,
+)
+from models.batchtst import BatchTSTConfig, BatchTSTNet
+from models.configurable_convnet import ConfigurableConvNet, ConfigurableConvNetConfig
+from models.inception_time import InceptionTimeConfig, InceptionTimeNet
 from models.simple_resnet import ResNetConfig, SimpleResNet
 
 
@@ -65,10 +75,103 @@ HYPERPARAMETER_DESCRIPTIONS: Dict[str, str] = {
 }
 
 
+def load_model_configuration(config_path: Optional[Path]) -> Dict[str, Any]:
+    """Load optional JSON model configuration from disk."""
+
+    if config_path is None:
+        return {}
+    if not config_path.exists():
+        raise FileNotFoundError(f"模型配置文件 {config_path} 不存在。")
+    with config_path.open("r", encoding="utf-8") as file:
+        data = json.load(file)
+    if not isinstance(data, dict):
+        raise ValueError("模型配置文件需要是一个 JSON 对象。")
+    return data
+
+
+def create_model(
+    model_name: str,
+    model_config: Dict[str, Any],
+    input_channels: int,
+    num_classes: int,
+    seq_len: int,
+) -> Tuple[nn.Module, Dict[str, Any]]:
+    """Instantiate the requested model architecture."""
+
+    if model_name == "resnet":
+        config = ResNetConfig(
+            input_channels=input_channels,
+            num_classes=num_classes,
+            base_filters=int(model_config.get("base_filters", 32)),
+            num_blocks=int(model_config.get("num_blocks", 3)),
+            kernel_size=int(model_config.get("kernel_size", 7)),
+            dropout=float(model_config.get("dropout", 0.1)),
+        )
+        model = SimpleResNet(config, seq_len)
+        return model, asdict(config)
+
+    if model_name == "inceptiontime":
+        kernel_sizes = tuple(int(k) for k in model_config.get("kernel_sizes", (9, 19, 39)))
+        config = InceptionTimeConfig(
+            input_channels=input_channels,
+            num_classes=num_classes,
+            num_blocks=int(model_config.get("num_blocks", 6)),
+            in_channels=int(model_config.get("in_channels", 32)),
+            bottleneck_channels=int(model_config.get("bottleneck_channels", 32)),
+            kernel_sizes=kernel_sizes,
+            use_residual=bool(model_config.get("use_residual", True)),
+            dropout=float(model_config.get("dropout", 0.1)),
+        )
+        model = InceptionTimeNet(config, seq_len)
+        return model, asdict(config)
+
+    if model_name == "batchtst":
+        config = BatchTSTConfig(
+            input_channels=input_channels,
+            num_classes=num_classes,
+            patch_len=int(model_config.get("patch_len", 32)),
+            stride=int(model_config.get("stride", 16)),
+            d_model=int(model_config.get("d_model", 128)),
+            num_heads=int(model_config.get("num_heads", 4)),
+            num_layers=int(model_config.get("num_layers", 2)),
+            dropout=float(model_config.get("dropout", 0.1)),
+        )
+        model = BatchTSTNet(config, seq_len)
+        return model, asdict(config)
+
+    if model_name == "custom":
+        config = ConfigurableConvNetConfig(
+            input_channels=input_channels,
+            num_classes=num_classes,
+            layers=model_config.get("layers", []),
+            dropout=float(model_config.get("dropout", 0.1)),
+        )
+        model = ConfigurableConvNet(config, seq_len)
+        config_dict = asdict(config)
+        # layers may contain non-serialisable objects; ensure pure python types
+        config_dict["layers"] = model_config.get("layers", config.layers)
+        return model, config_dict
+
+    raise ValueError(f"未知的模型类型: {model_name}")
+
+
+def describe_model(name: str, config: Dict[str, Any]) -> None:
+    print(f"\n==== 当前模型: {name} ====")
+    for key, value in config.items():
+        print(f"{key:>16}: {value}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", type=Path, default=Path("初赛数据集A/A/初赛数据集(6种)/初赛训练集"), help="Root directory containing class folders.")
     parser.add_argument("--cache", type=Path, default=Path("processed/dataset.npz"), help="Optional cache path for processed dataset.")
+    parser.add_argument("--model", choices=["resnet", "inceptiontime", "batchtst", "custom"], default="resnet", help="选择训练使用的网络结构。")
+    parser.add_argument(
+        "--model-config",
+        type=Path,
+        default=None,
+        help="自定义模型或覆盖默认结构的 JSON 配置文件路径。",
+    )
     parser.add_argument("--batch-size", type=int, default=TrainingHyperParameters.batch_size, help="Override default batch size.")
     parser.add_argument("--epochs", type=int, default=TrainingHyperParameters.epochs, help="Training epochs per run.")
     parser.add_argument("--learning-rate", type=float, default=TrainingHyperParameters.learning_rate, help="Learning rate for Adam optimizer.")
@@ -79,6 +182,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-runs", type=int, default=3, help="Number of repeated experiments.")
     parser.add_argument("--tsne", action="store_true", help="Whether to produce a TSNE visualization from the test set features.")
     parser.add_argument("--no-cache", action="store_true", help="Ignore cached dataset even if it exists.")
+    parser.add_argument(
+        "--inference-root",
+        type=Path,
+        default=Path("初赛数据集A/A/初赛测试集"),
+        help="真实测试集所在的文件夹路径。",
+    )
+    parser.add_argument(
+        "--prediction-output",
+        type=Path,
+        default=Path("outputs/test_predictions.txt"),
+        help="推理结果保存的 txt 文件路径。",
+    )
+    parser.add_argument("--skip-inference", action="store_true", help="只训练评估，不对真实测试集进行推理。")
     return parser.parse_args()
 
 
@@ -142,13 +258,15 @@ def train_model(
     """
 
     best_state = copy.deepcopy(model.state_dict())
-    best_metrics = {"val_accuracy": 0.0, "val_f1": 0.0, "epoch": 0}
+    best_metrics = {"val_accuracy": 0.0, "val_f1": 0.0, "epoch": 0, "train_accuracy": 0.0}
     history = {}
 
     for epoch in range(epochs):
         model.train()
         epoch_loss = 0.0
         total_batches = 0
+        train_correct = 0
+        train_total = 0
         for inputs, targets in train_loader:
             inputs = inputs.permute(0, 2, 1).to(device)
             targets = targets.to(device)
@@ -161,19 +279,33 @@ def train_model(
 
             epoch_loss += loss.item()
             total_batches += 1
+            predictions = torch.argmax(outputs, dim=1)
+            train_correct += (predictions == targets).sum().item()
+            train_total += targets.size(0)
         avg_loss = epoch_loss / max(total_batches, 1)
+        train_accuracy = (train_correct / max(train_total, 1)) * 100
 
         val_accuracy, val_f1, *_ = evaluate_model(model, val_loader, device, return_features=False)
         print(
-            f"Epoch {epoch + 1}/{epochs}, Loss={avg_loss:.4f}, "
+            f"Epoch {epoch + 1}/{epochs}, Loss={avg_loss:.4f}, TrainAcc={train_accuracy:.2f}%, "
             f"ValAcc={val_accuracy:.2f}%, ValF1={val_f1:.4f}"
         )
 
         if val_f1 > best_metrics["val_f1"]:
             best_state = copy.deepcopy(model.state_dict())
-            best_metrics = {"val_accuracy": val_accuracy, "val_f1": val_f1, "epoch": epoch + 1}
+            best_metrics = {
+                "val_accuracy": val_accuracy,
+                "val_f1": val_f1,
+                "epoch": epoch + 1,
+                "train_accuracy": train_accuracy,
+            }
 
-        history = {"epoch_loss": avg_loss, "val_accuracy": val_accuracy, "val_f1": val_f1}
+        history = {
+            "epoch_loss": avg_loss,
+            "val_accuracy": val_accuracy,
+            "val_f1": val_f1,
+            "train_accuracy": train_accuracy,
+        }
 
     model.load_state_dict(best_state)
     return best_metrics, history
@@ -244,6 +376,40 @@ def plot_tsne(features: np.ndarray, labels: np.ndarray, class_names: List[str], 
     plt.close()
 
 
+def run_inference(
+    model: nn.Module,
+    device: torch.device,
+    inference_data: Dict[str, np.ndarray],
+    class_names: List[str],
+    batch_size: int,
+    output_path: Path,
+) -> None:
+    """Generate predictions for unseen test files and save them to ``output_path``."""
+
+    model.eval()
+    predictions: Dict[str, str] = {}
+    with torch.no_grad():
+        for file_stem, windows in inference_data.items():
+            tensor = torch.tensor(windows, dtype=torch.float32)
+            loader = torch.utils.data.DataLoader(tensor, batch_size=batch_size, shuffle=False)
+            probs: List[torch.Tensor] = []
+            for batch in loader:
+                inputs = batch.permute(0, 2, 1).to(device)
+                logits = model(inputs)
+                probs.append(torch.softmax(logits, dim=1).cpu())
+            if not probs:
+                continue
+            mean_prob = torch.cat(probs, dim=0).mean(dim=0)
+            predicted_index = int(torch.argmax(mean_prob).item())
+            predictions[file_stem] = class_names[predicted_index]
+            print(f"推理结果 -> {file_stem}: {predictions[file_stem]}")
+
+    with output_path.open("w", encoding="utf-8") as writer:
+        for file_name in sorted(predictions.keys()):
+            writer.write(f"{file_name}\t{predictions[file_name]}\n")
+    print(f"真实测试集推理结果已保存至 {output_path}")
+
+
 def main() -> None:
     args = parse_args()
 
@@ -254,6 +420,18 @@ def main() -> None:
 
     hyperparams = build_hyperparameters(args)
     describe_hyperparameters(hyperparams)
+
+    model_config = load_model_configuration(args.model_config)
+    preview_model, model_details = create_model(
+        args.model,
+        model_config,
+        input_channels,
+        len(class_names),
+        seq_len,
+    )
+    describe_model(args.model, model_details)
+    print(f"模型参数量(初始化预览): {preview_model.count_parameters():,}")
+    del preview_model
 
     (
         train_loader,
@@ -278,10 +456,19 @@ def main() -> None:
     features_runs: List[np.ndarray] = []
     labels_runs: List[np.ndarray] = []
 
+    best_overall_state: Optional[Dict[str, torch.Tensor]] = None
+    best_overall_metrics: Optional[Dict[str, float]] = None
+
     for run in range(1, args.num_runs + 1):
         print(f"\n==== 第 {run} 次训练 ====")
-        config = ResNetConfig(input_channels=input_channels, num_classes=len(class_names))
-        model = SimpleResNet(config, seq_len=seq_len).to(device)
+        model, _ = create_model(
+            args.model,
+            model_config,
+            input_channels,
+            len(class_names),
+            seq_len,
+        )
+        model = model.to(device)
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.Adam(
             model.parameters(),
@@ -301,10 +488,14 @@ def main() -> None:
         )
         print(
             "最佳验证表现 -> "
-            f"Epoch={best_metrics['epoch']}, ValAcc={best_metrics['val_accuracy']:.2f}%, "
-            f"ValF1={best_metrics['val_f1']:.4f}"
+            f"Epoch={best_metrics['epoch']}, TrainAcc={best_metrics['train_accuracy']:.2f}%, "
+            f"ValAcc={best_metrics['val_accuracy']:.2f}%, ValF1={best_metrics['val_f1']:.4f}"
         )
         best_val_runs.append(best_metrics.copy())
+
+        if (best_overall_metrics is None) or (best_metrics["val_f1"] > best_overall_metrics["val_f1"]):
+            best_overall_metrics = best_metrics.copy()
+            best_overall_state = copy.deepcopy(model.state_dict())
 
         accuracy, f1_macro, all_labels, all_preds, features = evaluate_model(model, test_loader, device)
         acc_list.append(accuracy)
@@ -326,7 +517,7 @@ def main() -> None:
     print("\n==== 每次训练的最佳验证表现 ====")
     for idx, metrics in enumerate(best_val_runs, start=1):
         print(
-            f"Run {idx}: BestEpoch={metrics['epoch']}, "
+            f"Run {idx}: BestEpoch={metrics['epoch']}, TrainAcc={metrics['train_accuracy']:.2f}%, "
             f"ValAcc={metrics['val_accuracy']:.2f}%, ValF1={metrics['val_f1']:.4f}"
         )
 
@@ -342,6 +533,34 @@ def main() -> None:
         tsne_path = Path("outputs") / "tsne_overall.png"
         plot_tsne(avg_features, avg_labels, class_names, tsne_path)
         print(f"平均 t-SNE 图已保存至 {tsne_path}")
+
+    if not args.skip_inference:
+        if best_overall_state is None:
+            print("没有可用于推理的训练权重，已跳过真实测试集预测。")
+        else:
+            inference_data = load_inference_windows(args.inference_root)
+            if not inference_data:
+                print(f"在 {args.inference_root} 下未找到可用的测试文件，推理已跳过。")
+            else:
+                prediction_path = args.prediction_output
+                prediction_path.parent.mkdir(parents=True, exist_ok=True)
+                inference_model, _ = create_model(
+                    args.model,
+                    model_config,
+                    input_channels,
+                    len(class_names),
+                    seq_len,
+                )
+                inference_model.load_state_dict(best_overall_state)
+                inference_model = inference_model.to(device)
+                run_inference(
+                    inference_model,
+                    device,
+                    inference_data,
+                    class_names,
+                    args.batch_size,
+                    prediction_path,
+                )
 
 
 if __name__ == "__main__":

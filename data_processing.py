@@ -91,6 +91,31 @@ def assemble_dataset(class_dirs: Dict[str, Path]) -> Tuple[np.ndarray, np.ndarra
     return samples, labels, label_mapping
 
 
+def load_inference_windows(
+    directory: Path,
+    window_size: int = WINDOW_SIZE,
+    step: int = WINDOW_STEP,
+) -> Dict[str, np.ndarray]:
+    """Generate windowed samples for every Excel file in ``directory``.
+
+    The returned dictionary maps the stem of each file (e.g. ``test0001``) to
+    an array of shape ``(num_windows, window_size, num_channels)``. Files that
+    do not yield at least one full window are skipped with a warning message.
+    """
+
+    window_mapping: Dict[str, np.ndarray] = {}
+    for excel_path in sorted(directory.glob("*.xlsx")):
+        raw_signals = read_excel_signals(excel_path)
+        windows = sliding_window(raw_signals, window_size, step)
+        if windows.size == 0:
+            print(
+                f"[WARN] 文件 {excel_path.name} 不足以切分出一个长度为 {window_size} 的窗口，已跳过。"
+            )
+            continue
+        window_mapping[excel_path.stem] = windows
+    return window_mapping
+
+
 def create_dataloaders(
     samples: np.ndarray,
     labels: np.ndarray,
