@@ -95,29 +95,85 @@ def create_dataloaders(
     samples: np.ndarray,
     labels: np.ndarray,
     batch_size: int = 32,
-    test_size: float = 0.3,
+    test_size: float = 0.2,
+    val_size: float = 0.1,
     random_state: int = 42,
-) -> Tuple[DataLoader, DataLoader, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Split samples into training/testing sets and wrap in DataLoaders."""
+) -> Tuple[
+    DataLoader,
+    DataLoader,
+    DataLoader,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Split samples into training/validation/testing sets and wrap in DataLoaders.
 
+    Parameters
+    ----------
+    samples, labels:
+        Pre-processed dataset arrays.
+    batch_size:
+        Mini-batch size used by the returned DataLoaders.
+    test_size:
+        Fraction of the total dataset reserved for the final test split.
+    val_size:
+        Fraction of the total dataset reserved for validation. The validation
+        portion is taken from the remaining data after the test split.
+    random_state:
+        Seed controlling the deterministic behaviour of the shuffling.
+    """
+
+    if test_size + val_size >= 1.0:
+        raise ValueError("The sum of test_size and val_size must be < 1.0")
+
+    all_indices = np.arange(samples.shape[0])
     train_indices, test_indices = train_test_split(
-        np.arange(samples.shape[0]),
+        all_indices,
         test_size=test_size,
         random_state=random_state,
         stratify=labels,
     )
-    train_samples = torch.tensor(samples[train_indices], dtype=torch.float32)
-    train_labels = torch.tensor(labels[train_indices], dtype=torch.long)
-    test_samples = torch.tensor(samples[test_indices], dtype=torch.float32)
-    test_labels = torch.tensor(labels[test_indices], dtype=torch.long)
+
+    remaining_val_fraction = val_size / (1.0 - test_size)
+    train_indices, val_indices = train_test_split(
+        train_indices,
+        test_size=remaining_val_fraction,
+        random_state=random_state,
+        stratify=labels[train_indices],
+    )
+
+    def _to_tensor(index_array: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor]:
+        return (
+            torch.tensor(samples[index_array], dtype=torch.float32),
+            torch.tensor(labels[index_array], dtype=torch.long),
+        )
+
+    train_samples, train_labels = _to_tensor(train_indices)
+    val_samples, val_labels = _to_tensor(val_indices)
+    test_samples, test_labels = _to_tensor(test_indices)
 
     train_dataset = TensorDataset(train_samples, train_labels)
+    val_dataset = TensorDataset(val_samples, val_labels)
     test_dataset = TensorDataset(test_samples, test_labels)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-    return train_loader, test_loader, train_samples, train_labels, test_samples, test_labels
+    return (
+        train_loader,
+        val_loader,
+        test_loader,
+        train_samples,
+        train_labels,
+        val_samples,
+        val_labels,
+        test_samples,
+        test_labels,
+    )
 
 
 def save_numpy_dataset(
