@@ -49,3 +49,4 @@ fig.write_image('results.png', scale=4, height=900, width=700)
 
 x = 1
 
+y = 1
